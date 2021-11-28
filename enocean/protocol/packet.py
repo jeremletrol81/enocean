@@ -1,12 +1,15 @@
 # -*- encoding: utf-8 -*-
 from __future__ import print_function, unicode_literals, division, absolute_import
+
 import logging
 from collections import OrderedDict
+from typing import List, Union
 
 import enocean.utils
+from Crypto.Cipher import AES
 from enocean.protocol import crc8
-from enocean.protocol.eep import EEP
 from enocean.protocol.constants import PACKET, RORG, PARSE_RESULT, DB0, DB2, DB3, DB4, DB6
+from enocean.protocol.eep import EEP
 
 
 class Packet(object):
@@ -59,7 +62,7 @@ class Packet(object):
 
     def __eq__(self, other):
         return self.packet_type == other.packet_type and self.rorg == other.rorg \
-            and self.data == other.data and self.optional == other.optional
+               and self.data == other.data and self.optional == other.optional
 
     @property
     def _bit_data(self):
@@ -75,7 +78,7 @@ class Packet(object):
     def _bit_data(self, value):
         # The same as getting the data, first and last 5 bits are ommitted, as they are defined...
         for byte in range(len(self.data) - 6):
-            self.data[byte+1] = enocean.utils.from_bitarray(value[byte*8:(byte+1)*8])
+            self.data[byte + 1] = enocean.utils.from_bitarray(value[byte * 8:(byte + 1) * 8])
 
     # # COMMENTED OUT, AS NOTHING TOUCHES _bit_optional FOR NOW.
     # # Thus, this is also untested.
@@ -309,6 +312,25 @@ class RadioPacket(Packet):
         return Packet.create(PACKET.RADIO_ERP1, rorg, rorg_func, rorg_type,
                              direction, command, destination, sender, learn, **kwargs)
 
+    @staticmethod
+    def convert_to_int(data: List[int]) -> int:
+        return int(bytearray(data).hex(), 16)
+
+    @staticmethod
+    def hex_str(data: Union[str, int, List[int]], rsize: int = 0, lsize: int = 0) -> str:
+        if type(data) == str:
+            return data.rjust(rsize, '0').ljust(lsize, '0')
+        if type(data) == list:
+            if rsize == 0:
+                return hex(RadioPacket.convert_to_int(data))[2:].rjust(rsize, '0').ljust(lsize, '0')
+            else:
+                return hex(RadioPacket.convert_to_int(data))[2:].rjust(len(data) * 2, '0').ljust(lsize, '0')
+        return hex(data)[2:].rjust(rsize, '0').ljust(lsize, '0')
+
+    @staticmethod
+    def bin_str(data: int, rsize: int = 0, lsize: int = 0) -> str:
+        return bin(data)[2:].rjust(rsize, '0').ljust(lsize, '0')
+
     @property
     def sender_int(self):
         return enocean.utils.combine_hex(self.sender)
@@ -324,6 +346,22 @@ class RadioPacket(Packet):
     @property
     def destination_hex(self):
         return enocean.utils.to_hex_string(self.destination)
+
+    def subkey(self):
+        const_0 = [0x00] * 16
+        const_rb = 0x87
+        mask = self.convert_to_int([0xFF] * 16)
+
+        L = int(self.aes.encrypt(bytearray(const_0)).hex(), 16)
+        K1 = L << 1
+        if self.bin_str(L, 128)[0] != '0':
+            K1 ^= const_rb
+        K1 &= mask
+        K2 = K1 << 1
+        if self.bin_str(K1, 128)[0] != '0':
+            K2 ^= const_rb
+        K2 &= mask
+        self.K1, self.K2 = K1, K2
 
     def parse(self):
         self.destination = self.optional[1:5]
@@ -347,6 +385,36 @@ class RadioPacket(Packet):
                     self.rorg_type = enocean.utils.from_bitarray(self._bit_data[DB3.BIT_1:DB2.BIT_2])
                     self.rorg_manufacturer = enocean.utils.from_bitarray(self._bit_data[DB2.BIT_2:DB0.BIT_7])
                     self.logger.debug('learn received, EEP detected, RORG: 0x%02X, FUNC: 0x%02X, TYPE: 0x%02X, Manufacturer: 0x%02X' % (self.rorg, self.rorg_func, self.rorg_type, self.rorg_manufacturer))  # noqa: E501
+        if self.rorg == RORG.SEC_ENCAPS:
+            self.data_s = self.data[1:-8]
+            self.cmac_s = self.data[-8:-5]
+            self.rlc = [0x00, 0x00, 0x00]
+            self.key = [0x4b, 0x26, 0x4, 0xd5, 0x85, 0xb3, 0x35, 0x54, 0x21, 0xa3, 0x61, 0xd6, 0x33, 0x45, 0xde, 0x59]
+            self.aes = AES.new(bytearray(self.key), AES.MODE_ECB)
+            self.vaes_init_vector = 0x3410de8f1aba3eff9f5a117172eacabd
+
+            self.subkey()
+
+            found = False
+            for i in range(128):
+                rlc = self.hex_str(self.convert_to_int(self.rlc) + i, 6)
+                mesg = self.hex_str(self.rorg) + self.hex_str(self.data_s) + rlc + '8'
+                subkey_value = self.K2 if len(mesg) != 32 else self.K1
+                mesg = int(self.hex_str(mesg, lsize=32), 16)
+                cmac = self.aes.encrypt(bytes.fromhex(self.hex_str(subkey_value ^ mesg))).hex()[:len(self.cmac_s)]
+                if int(cmac, 16) == self.cmac_s:
+                    self.rlc = rlc
+                    found = True
+                    break
+
+            if not found:
+                # TODO: Error of rlc
+                pass
+
+            enc = self.aes.encrypt(bytes.fromhex(self.hex_str(self.vaes_init_vector ^ self.convert_to_int(self.rlc))))
+            result = int(self.hex_str(self.data_s, lsize=32), 16) ^ int(enc.hex(), 16)
+            self.data.pop(0)
+            self.data[:len(self.data_s) * 2] = list(map(int, bytearray(bytes.fromhex(self.hex_str(result)[:len(self.data_s) * 2]))))
 
         return super(RadioPacket, self).parse()
 
